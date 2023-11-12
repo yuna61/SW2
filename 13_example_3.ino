@@ -1,127 +1,82 @@
 #include <Servo.h>
 
 // Arduino pin assignment
-#define PIN_TRIG  12  // sonar sensor TRIGGER
-#define PIN_ECHO  13  // sonar sensor ECHO
+
+#define PIN_IR    0         // IR sensor at Pin A0
+#define PIN_LED   6
 #define PIN_SERVO 10
 
-// configurable parameters for sonar
-#define SND_VEL 346.0     // sound velocity at 24 celsius degree (unit: m/sec)
-#define PULSE_DURATION 10 // ultra-sound Pulse Duration (unit: usec)
-#define _DIST_MIN 180.0   // minimum distance to be measured (unit: mm)
-#define _DIST_MAX 360.0   // maximum distance to be measured (unit: mm)
+#define _DUTY_MIN 8  // servo full clock-wise position (0 degree)
+#define _DUTY_NEU 804   // servo neutral position (90 degree)
+#define _DUTY_MAX 1600  // servo full counter-clockwise position (180 degree)
 
-#define TIMEOUT ((INTERVAL / 2) * 1000.0) // maximum echo waiting time (unit: usec)
-#define SCALE (0.001 * 0.5 * SND_VEL) // coefficent to convert duration to distance
 
-// configurable parameters for Servo
-#define _DUTY_MIN 8 // servo full clock-wise position (0 degree)
-#define _DUTY_NEU 500 // servo neutral position (90 degree)
-#define _DUTY_MAX 1800 // servo full counter-clockwise position (180 degree)
+#define _TARGET_LOW  100.0
+#define _TARGET_HIGH 250.0
+#define _DIST_MIN  100.0   // minimum distance 100mm
+#define _DIST_MAX  250.0   // maximum distance 250mm
 
-#define _POS_START (_DUTY_MIN + 100)    // servo start position
-#define _POS_END   (_DUTY_MAX - 100)    // servo end position
+#define _EMA_ALPHA  0.5      // for EMA Filter
 
-#define _SERVO_SPEED 30 // servo angular speed (unit: degree/sec)
-
-// Loop Interval
-#define INTERVAL 20     // servo update interval (unit: msec)
-
-// global variables
-unsigned long last_sampling_time; // unit: msec
+#define LOOP_INTERVAL 20   // Loop Interval (unit: msec)
 
 Servo myservo;
+unsigned long last_loop_time;   // unit: msec
 
-int duty_change_per_interval; // maximum duty difference per interval
-int duty_target;    // Target duty time
-int duty_curr;      // Current duty time
+float dist_prev = _DIST_MIN;
+float dist_ema = _DIST_MIN;
 
-int toggle_interval, toggle_interval_cnt;
-
-void setup() {
-  // initialize GPIO pins
-  pinMode(PIN_TRIG, OUTPUT);  // sonar TRIGGER
-  pinMode(PIN_ECHO, INPUT);   // sonar ECHO
-  digitalWrite(PIN_TRIG, LOW);  // turn-off Sonar 
-
-  myservo.attach(PIN_SERVO); 
-  
-  duty_target = duty_curr = _POS_START;
-  myservo.writeMicroseconds(duty_curr);
-  
-  // initialize serial port
-  Serial.begin(57600);  // <----- baud rate
-
-  // convert angular velocity into duty change per interval.
-  // duty_change_per_interval = 
-  //  (_DUTY_MAX - _DUTY_MIN) * (_SERVO_SPEED / 180) * (INTERVAL / 1000);
-  duty_change_per_interval = 
-    (float)(_DUTY_MAX - _DUTY_MIN) * (_SERVO_SPEED / 180.0) * (INTERVAL / 1000.0);
-  
-  // remove next three lines after finding answers
-  Serial.print("duty_change_per_interval:");
-  Serial.println(duty_change_per_interval);
-  //  while (1) { }
-
-  // initialize variables for servo update.
-  toggle_interval = (180.0 / _SERVO_SPEED) * 1000 / INTERVAL;
-  toggle_interval_cnt = toggle_interval;
-  
-  // initialize last sampling time
-  last_sampling_time = 0;
-}
-
-void loop() {
-  float  dist_raw;
-
-  // wait until next sampling time. 
-  if (millis() < (last_sampling_time + INTERVAL))
-    return;
-
-  dist_raw = USS_measure(PIN_TRIG, PIN_ECHO); // read distance
-
-  // adjust duty_curr toward duty_target by duty_change_per_interval
-  if (duty_target > duty_curr) {
-    duty_curr += duty_change_per_interval;
-    if (duty_curr > duty_target)
-        duty_curr = duty_target;
-  } else {
-    duty_curr -= duty_change_per_interval;
-    if (duty_curr < duty_target)
-      duty_curr = duty_target;
-  }
-
-  // update servo position
-  myservo.writeMicroseconds(duty_curr);
-
-  // output the read value to the serial port
-  Serial.print("Min:1000");
-  Serial.print(",duty_target:"); Serial.print(duty_target);
-  Serial.print(",duty_curr:");   Serial.print(duty_curr);
-  Serial.print(",dist_raw:");   Serial.print(dist_raw);
-  Serial.println(",Max:2000");
-
-  // toggle duty_target between _DUTY_MIN and _DUTY_MAX.
-  if (toggle_interval_cnt >= toggle_interval) {
-    toggle_interval_cnt = 0;
-    if (duty_target == _POS_START)
-      duty_target = _POS_END;
-    else
-      duty_target = _POS_START;
-  } else {
-    toggle_interval_cnt++;
-  }
-
-  // update last sampling time
-  last_sampling_time += INTERVAL;
-}
-
-// get a distance reading from USS. return value is in millimeter.
-float USS_measure(int TRIG, int ECHO)
+void setup()
 {
-  digitalWrite(TRIG, HIGH);
-  delayMicroseconds(PULSE_DURATION);
-  digitalWrite(TRIG, LOW);
+  pinMode(PIN_LED, OUTPUT);
   
-  return pulseIn(ECHO, HIGH, TIMEOUT) * SCALE; // unit: mm
+  myservo.attach(PIN_SERVO); 
+  myservo.writeMicroseconds(_DUTY_NEU);
+  
+  Serial.begin(1000000);    // 1,000,000 bps
+}
+
+void loop()
+{
+  unsigned long time_curr = millis();
+  int duty;
+  float a_value, dist_raw;
+
+  // wait until next event time
+  if (time_curr < (last_loop_time + LOOP_INTERVAL))
+    return;
+  last_loop_time += LOOP_INTERVAL;
+
+  a_value = analogRead(PIN_IR);
+  dist_raw = (6762.0 / (a_value - 9.0) - 4.0) * 10.0 - 60.0;
+
+
+  if ((dist_raw == 0.0) || (dist_raw > _DIST_MAX)) {
+        //dist_raw = _DIST_MAX + 10.0;    // Set Higher Value
+        dist_raw = dist_prev;
+        digitalWrite(PIN_LED, 1);       // LED OFF
+    } else if (dist_raw < _DIST_MIN) {
+        //dist_raw = _DIST_MIN - 10.0;    // Set Lower Value
+        dist_raw = dist_prev;
+        digitalWrite(PIN_LED, 1);       // LED OFF
+    } else {    // In desired Range
+        digitalWrite(PIN_LED, 0);       // LED ON      
+    }
+
+  dist_ema = _EMA_ALPHA * dist_raw + (1-_EMA_ALPHA) * dist_prev; // Put EMA filter code here
+      
+  duty = ((_DUTY_MAX - _DUTY_MIN) * (dist_ema - _TARGET_LOW) / (_TARGET_HIGH - _TARGET_LOW)) + _DUTY_MIN;
+  myservo.writeMicroseconds(duty);
+
+  Serial.print("_DUTY_MIN:");  Serial.print(_DUTY_MIN);
+  Serial.print("_DIST_MIN:");  Serial.print(_DIST_MIN);
+  Serial.print(",IR:");        Serial.print(a_value);
+  Serial.print(",dist_raw:");  Serial.print(dist_raw);
+  Serial.print(",ema:");       Serial.print(dist_ema);
+  Serial.print(",servo:");     Serial.print(duty);
+  Serial.print(",_DIST_MAX:"); Serial.print(_DIST_MAX);
+  Serial.print(",_DUTY_MAX:"); Serial.print(_DUTY_MAX);
+  Serial.println("");
+
+  dist_prev = dist_ema;
 }
